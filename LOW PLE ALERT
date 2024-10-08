@@ -1,0 +1,78 @@
+ USE Admin;
+GO
+
+CREATE or ALTER PROCEDURE dbo.CheckPLEAndSendAlert
+AS
+BEGIN
+
+DECLARE @ple_value INT;
+    DECLARE @subject NVARCHAR(100);
+    DECLARE @body NVARCHAR(MAX);
+
+    -- Check current Page Life Expectancy (PLE)
+    SELECT @ple_value = cntr_value
+    FROM sys.dm_os_performance_counters
+    WHERE object_name LIKE '%Buffer Manager%' 
+      AND counter_name = 'Page life expectancy';
+
+    -- If PLE is below 600 seconds (10 minutes)
+    IF @ple_value < 600
+    BEGIN
+        SET @subject = 'Alert: PLE Drop Detected on SQL Server';
+        
+        -- Initialize the HTML email body with table headers
+        SET @body = 
+        '<html><body>' +
+        '<h3>PLE has dropped below the threshold. Current value: ' + CAST(@ple_value AS NVARCHAR(10)) + '.</h3>' +
+        '<p>Below are the potential memory-intensive queries (please independently verify the accuracy of this information):</p>' +
+        '<table border="1" cellpadding="5" cellspacing="0" style="border-collapse: collapse; font-family: Arial, sans-serif;">' +
+        '<tr style="background-color: #f2f2f2;">' +
+        '<th>SessionID</th>' +
+        '<th>Login</th>' +
+        '<th>Command</th>' +
+        '<th>Query Text</th>' +
+        '<th>Stored Proc</th>' +
+        '<th>Granted Memory (MB)</th>' +
+        '</tr>';
+
+        DECLARE @queryInfo NVARCHAR(MAX);
+        SET @queryInfo = '';
+
+        -- Append query details to the HTML table
+        SELECT TOP 5
+		@queryInfo = @queryInfo + 
+            '<tr>' +
+            '<td>' + CAST(r.session_id AS NVARCHAR(10)) + '</td>' +
+            '<td>' + s.login_name + '</td>' +
+            '<td>' + r.command + '</td>' +
+            '<td>' + LEFT(st.text, 50) + '</td>' +  -- Limiting the query text for display
+            '<td>' + ISNULL(OBJECT_NAME(st.objectid, st.dbid), 'Ad-Hoc') + '</td>' +
+            '<td>' + CAST(mg.granted_memory_kb / 1024 AS NVARCHAR(10)) + ' MB</td>' +
+            '</tr>'
+        FROM             sys.dm_exec_query_memory_grants mg
+        JOIN             sys.dm_exec_requests r ON mg.session_id = r.session_id
+        JOIN             sys.dm_exec_sessions s ON r.session_id = s.session_id
+        CROSS APPLY      sys.dm_exec_sql_text(r.sql_handle) AS st
+		WHERE r.session_id <> @@SPID
+        ORDER BY         mg.granted_memory_kb DESC;
+
+        -- Close the HTML table
+        SET @body = @body + @queryInfo + '</table>';
+
+        -- Add potential causes of low PLE to the HTML email body
+        SET @body = @body + '<p><strong>Potential Cause of Low PLE:</strong></p>' +
+                    '<ul>' +
+                    '<li>Check for any long-running or poorly optimized queries that might be causing buffer pool churn.</li>' +
+                    '</ul>' +
+                    '</body></html>';
+
+        -- Send the email with the gathered information using HTML format
+        EXEC msdb.dbo.sp_send_dbmail
+          @profile_name = 'default',   -- Replace with your Database Mail profile name
+            @recipients = 'henokteka87@yahoo.com',  -- Replace with the desired recipients
+            @subject = @subject,
+            @body = @body,
+            @body_format = 'HTML';  -- Ensure that the email is sent in HTML format
+   END
+END
+GO
